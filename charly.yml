@@ -1,0 +1,77 @@
+# The CRIU layer: the checkpoint/restore tool, and the ONE pre-flight the containerd dump
+# path actually depends on. CONTAINERD-IMAGES.md §1.4 (`criu-host`) and CONTAINERD.md §10.
+#
+# The pre-flight is deliberately a `check:` and not a `run:`: it asserts a property of the
+# host kernel and of the namespace the daemon runs in, it installs nothing, and it must be
+# re-runnable at any time.
+layer-criu:
+    candy:
+        description: |
+            CRIU (checkpoint/restore in userspace) for the rootful containerd daemon, plus the
+            pre-flight that decides whether a checkpoint can be taken at all. The pre-flight is
+            `criu check --unprivileged --feature seccomp_suspend`, run from the namespace the
+            rootful daemon runs in, and it requires BOTH a zero exit status AND the line
+            `seccomp_suspend is supported`. The named `--feature` form short-circuits CRIU's own
+            check (`criu/cr-check.c:1659-1664`), so the exit status IS the feature's result; the
+            bulk `--extra` form is never a gate, because it is non-zero even on a host that
+            checkpoints perfectly (`UFFD is not supported`). `--unprivileged` is required:
+            without it CRIU fails earlier, in the mount namespace, with the same non-zero status
+            but a different cause. The two gates report on DIFFERENT streams — the capability
+            gate writes to stdout, the seccomp probe to stderr — so the check captures each to
+            its own file and requires the success line in either (CONTAINERD.md §10). A
+            non-root dump also needs `cap_sys_admin` on the binary, not CRIU's recommended
+            `cap_checkpoint_restore`: the kernel gates `PTRACE_O_SUSPEND_SECCOMP` on
+            `capable(CAP_SYS_ADMIN)` in the INIT user namespace. For a rootful daemon that is
+            the init user namespace, so the check runs at root; a rootless daemon's CRIU cannot
+            pass the same probe, and no capability combination changes that.
+        package:
+            - criu
+        plan:
+            - check: the criu binary is installed
+              id: criu-installed
+              file:
+                  file: /usr/bin/criu
+                  exists: true
+            - check: criu runs and reports a version
+              id: criu-version
+              exit_status: 0
+              stdout:
+                  - matches: '[0-9]+\.[0-9]+'
+              command: criu --version
+            # THE PRE-FLIGHT. Build-context cannot prove it (a build container has neither the
+            # host kernel nor the daemon's namespace), so it is a runtime check. It is
+            # host-side (`in_container: false`) on purpose: a container's user namespace is
+            # NOT the rootful daemon's, and the kernel's capability check is in the init user
+            # namespace.
+            - check: the rootful daemon's CRIU can suspend seccomp — exit 0 AND the named feature line
+              id: criu-seccomp-suspend
+              context: [runtime]
+              exit_status: 0
+              command:
+                  in_container: false
+                  command: |
+                      set -eu
+                      # Run in the namespace the rootful daemon runs in: the init user
+                      # namespace, i.e. root on this host (CONTAINERD.md §10).
+                      as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+                      out="$(mktemp)"
+                      err="$(mktemp)"
+                      rc=0
+                      as_root criu check --unprivileged --feature seccomp_suspend >"$out" 2>"$err" || rc=$?
+                      # The two gates report on different streams: the capability gate on
+                      # stdout, the seccomp probe on stderr. Read each into its own file.
+                      echo "--- stdout ---"
+                      cat "$out"
+                      echo "--- stderr ---" >&2
+                      cat "$err" >&2
+                      if [ "$rc" -ne 0 ]; then
+                        echo "criu check exited $rc: this host cannot suspend the target's seccomp filter" >&2
+                        echo "  'CRIU needs to have the CAP_SYS_ADMIN ...' = the capability is missing (remediable)" >&2
+                        echo "  'couldn't suspend seccomp' = the namespace barrier (a rootless daemon; no capability helps)" >&2
+                        exit "$rc"
+                      fi
+                      if ! grep -q 'seccomp_suspend is supported' "$out" "$err"; then
+                        echo "criu check exited 0 but printed no 'seccomp_suspend is supported' line" >&2
+                        exit 1
+                      fi
+                      echo "seccomp_suspend is supported (exit 0)"
