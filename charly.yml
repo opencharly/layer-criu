@@ -75,3 +75,91 @@ layer-criu:
                         exit 1
                       fi
                       echo "seccomp_suspend is supported (exit 0)"
+
+# =============================================================================
+# THE R10 BED — a disposable guest, because the pre-flight is about the KERNEL.
+# `criu check --unprivileged --feature seccomp_suspend` asserts a property of the
+# running kernel and of the namespace the rootful daemon runs in; a build container
+# has neither, which is why the check carries `context: [runtime]` and why it SKIPS
+# in box mode. opencharly/sdk#362's A2/R10 block was exactly this: no
+# `disposable: true` target existed, so the pre-flight never executed.
+#
+# The candy is applied by the VM deploy's own `add_candy:` (the substrate's path),
+# so the candy's own three checks run against the guest at deploy-add AND at
+# check-live, and the bed's own step below asserts the same contract at bed level.
+# =============================================================================
+criu-vm-base:
+    vm:
+        source:
+            # A Fedora cloud guest: CRIU is packaged there, and a dnf install keeps the
+            # running kernel's module tree, so no pacman IgnorePkg hold is needed.
+            kind: cloud_image
+            url: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+            base_user: fedora
+            distro: fedora
+        backend: libvirt
+        disk_size: 20G
+        ram: 4G
+        cpu: 2
+        machine: q35
+        firmware: bios
+        ssh:
+            port_auto: true
+            key_source: generate
+        cloud_init:
+            timezone: UTC
+            package:
+                - sudo
+
+check-criu-vm:
+    vm:
+        from: criu-vm-base
+        disposable: true
+        lifecycle: test
+        add_candy:
+            - layer-criu
+        description: |-
+            The CRIU pre-flight on a DISPOSABLE guest, in the three-step shape. ABSENCE:
+            the guest is fresh, so before this deploy applies the candy `criu` is not on
+            PATH — that is the state the candy exists to change, and the deploy's
+            add_candy is what changes it. PERFORM: the candy's own plan installs the
+            package and runs the pre-flight. PRESENCE: the pre-flight returns 0 AND prints
+            the `seccomp_suspend is supported` line ON THE GUEST'S OWN KERNEL, which is
+            the only place the claim can be true — a build container has neither the
+            kernel nor the daemon's namespace. The check runs at deploy-add AND at
+            check-live, so a fresh `charly update` rebuild re-evaluates it against the
+            rebuilt guest rather than passing by coincidence.
+        plan:
+            - check: the candy is installed on the guest, which is what makes the pre-flight meaningful
+              id: criu-present-on-guest
+              context: [runtime]
+              file:
+                  file: /usr/bin/criu
+                  exists: true
+            - check: the guest kernel permits the seccomp suspend the rootful daemon needs — exit 0 AND the named line
+              id: criu-seccomp-suspend-on-guest
+              context: [runtime]
+              exit_status: 0
+              command:
+                  in_container: false
+                  command: |
+                      set -eu
+                      # Same contract as the candy's own `criu-seccomp-suspend`: the exit
+                      # status AND the named line, read from BOTH streams because the
+                      # capability gate writes to stdout and the seccomp probe to stderr.
+                      as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+                      out="$(mktemp)"
+                      err="$(mktemp)"
+                      rc=0
+                      as_root criu check --unprivileged --feature seccomp_suspend >"$out" 2>"$err" || rc=$?
+                      echo "--- stdout ---"; cat "$out"
+                      echo "--- stderr ---" >&2; cat "$err" >&2
+                      if [ "$rc" -ne 0 ]; then
+                        echo "criu check exited $rc on this guest: it cannot suspend the target's seccomp filter" >&2
+                        exit "$rc"
+                      fi
+                      if ! grep -q 'seccomp_suspend is supported' "$out" "$err"; then
+                        echo "criu check exited 0 but printed no 'seccomp_suspend is supported' line" >&2
+                        exit 1
+                      fi
+                      echo "seccomp_suspend is supported on the guest kernel (exit 0)"
