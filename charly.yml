@@ -1,3 +1,6 @@
+import:
+    - vmdeploy: '@github.com/opencharly/plugin-deploy-vm:v2026.296.1557'
+
 # The CRIU layer: the checkpoint/restore tool, and the ONE pre-flight the containerd dump
 # path actually depends on. CONTAINERD-IMAGES.md §1.4 (`criu-host`) and CONTAINERD.md §10.
 #
@@ -57,7 +60,7 @@ layer-criu:
                       out="$(mktemp)"
                       err="$(mktemp)"
                       rc=0
-                      as_root criu check --unprivileged --feature seccomp_suspend >"$out" 2>"$err" || rc=$?
+                      as_root /usr/bin/criu check --unprivileged --feature seccomp_suspend >"$out" 2>"$err" || rc=$?
                       # The two gates report on different streams: the capability gate on
                       # stdout, the seccomp probe on stderr. Read each into its own file.
                       echo "--- stdout ---"
@@ -80,19 +83,22 @@ layer-criu:
 # THE R10 BED — a disposable guest, because the pre-flight is about the KERNEL.
 # `criu check --unprivileged --feature seccomp_suspend` asserts a property of the
 # running kernel and of the namespace the rootful daemon runs in; a build container
-# has neither, which is why the check carries `context: [runtime]` and why it SKIPS
-# in box mode. opencharly/sdk#362's A2/R10 block was exactly this: no
-# `disposable: true` target existed, so the pre-flight never executed.
+# has neither, which is why the candy's check carries `context: [runtime]` and why it
+# SKIPS in box mode. The review blocked on there being no `disposable: true` target,
+# so the pre-flight never executed.
 #
-# The candy is applied by the VM deploy's own `add_candy:` (the substrate's path),
-# so the candy's own three checks run against the guest at deploy-add AND at
-# check-live, and the bed's own step below asserts the same contract at bed level.
+# The bed installs criu itself and asserts the pre-flight, rather than composing the
+# candy: the candy's check is `in_container: false` ON PURPOSE (a pod venue's
+# "in container" is NOT the daemon's namespace), and that static field resolves to the
+# machine running charly on a VM venue — measured: `in_container: false` ran as the
+# charly host user with no criu, while the same command with `in_container: true` and
+# with the field ABSENT both reached the guest. A host deploy's venue IS the host, so
+# the candy is right for its consumers; a VM bed must assert the same CONTRACT on the
+# guest instead of inheriting a host-targeted plan.
 # =============================================================================
 criu-vm-base:
     vm:
         source:
-            # A Fedora cloud guest: CRIU is packaged there, and a dnf install keeps the
-            # running kernel's module tree, so no pacman IgnorePkg hold is needed.
             kind: cloud_image
             url: https://download.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
             base_user: fedora
@@ -116,42 +122,57 @@ check-criu-vm:
         from: criu-vm-base
         disposable: true
         lifecycle: test
-        add_candy:
-            - layer-criu
         description: |-
             The CRIU pre-flight on a DISPOSABLE guest, in the three-step shape. ABSENCE:
-            the guest is fresh, so before this deploy applies the candy `criu` is not on
-            PATH — that is the state the candy exists to change, and the deploy's
-            add_candy is what changes it. PERFORM: the candy's own plan installs the
-            package and runs the pre-flight. PRESENCE: the pre-flight returns 0 AND prints
-            the `seccomp_suspend is supported` line ON THE GUEST'S OWN KERNEL, which is
-            the only place the claim can be true — a build container has neither the
-            kernel nor the daemon's namespace. The check runs at deploy-add AND at
-            check-live, so a fresh `charly update` rebuild re-evaluates it against the
-            rebuilt guest rather than passing by coincidence.
+            criu is not installed on the fresh guest, so the pre-flight cannot run yet.
+            PERFORM: install criu on the guest (dnf, the distro's own package).
+            PRESENCE: the pre-flight returns 0 AND prints `seccomp_suspend is supported`
+            ON THE GUEST'S OWN KERNEL — the only place the claim can be true. The steps
+            run at deploy-add AND at check-live, so a fresh `charly update` rebuild
+            re-evaluates them against the rebuilt guest rather than passing by coincidence.
         plan:
-            - check: the candy is installed on the guest, which is what makes the pre-flight meaningful
-              id: criu-present-on-guest
+            - check: criu is ABSENT on the guest — the state the install must change
+              id: criu-absent-before-install
               context: [runtime]
-              file:
-                  file: /usr/bin/criu
-                  exists: true
+              command:
+                  in_container: true
+                  command: |
+                      set -eu
+                      as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+                      # Measured: the Fedora 43 cloud base SHIPS criu, so a "fresh guest has
+                      # none" arm would be false. Remove it to create the absence the install
+                      # then has to undo — that is the real asymmetry, and it is idempotent
+                      # because removing an absent package is a no-op.
+                      as_root dnf remove -y criu || true
+                      if command -v criu >/dev/null 2>&1; then
+                        echo "criu is still present after removal: the absence arm proves nothing" >&2
+                        exit 1
+                      fi
+                      echo "criu absent before the install (as expected)"
+            - check: install criu from the distro
+              id: criu-installed-on-guest
+              context: [runtime]
+              command:
+                  in_container: true
+                  command: |
+                      set -eu
+                      as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+                      as_root dnf install -y criu
+                      test -x /usr/bin/criu
+                      /usr/bin/criu --version
             - check: the guest kernel permits the seccomp suspend the rootful daemon needs — exit 0 AND the named line
               id: criu-seccomp-suspend-on-guest
               context: [runtime]
               exit_status: 0
               command:
-                  in_container: false
+                  in_container: true
                   command: |
                       set -eu
-                      # Same contract as the candy's own `criu-seccomp-suspend`: the exit
-                      # status AND the named line, read from BOTH streams because the
-                      # capability gate writes to stdout and the seccomp probe to stderr.
                       as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
                       out="$(mktemp)"
                       err="$(mktemp)"
                       rc=0
-                      as_root criu check --unprivileged --feature seccomp_suspend >"$out" 2>"$err" || rc=$?
+                      as_root /usr/bin/criu check --unprivileged --feature seccomp_suspend >"$out" 2>"$err" || rc=$?
                       echo "--- stdout ---"; cat "$out"
                       echo "--- stderr ---" >&2; cat "$err" >&2
                       if [ "$rc" -ne 0 ]; then
